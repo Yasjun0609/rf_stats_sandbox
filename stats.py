@@ -281,23 +281,26 @@ def event_label(data):
     return None
 
 
-def iter_sessions(dirs, target_date, since=None):
+def iter_sessions(dirs, target_date, since=None, until=None):
     """Yield (operator, task_type_or_None, event_label_or_None, duration, score_or_None)
     for every matching session. score is None unless the session has a session_score.json.
 
-    since, when given, is an epoch time: only sessions whose session_meta.json was
-    written after it are kept. The meta file is written when a recording ends, so this
-    reads as "sessions finished after since" -- how a shift mark splits the day."""
+    since and until, when given, are epoch times: only sessions whose session_meta.json
+    was written after since, and no later than until, are kept. The meta file is
+    written when a recording ends, so this reads as "sessions finished between since
+    and until" -- how shift marks split the day."""
     for d in dirs:
         for parent in sorted(glob.glob(os.path.join(d, "*"))):
             for path, duration in classify_session(parent):
                 if os.path.basename(os.path.dirname(path)).endswith("_mpeg"):
                     continue
-                if target_date is not None or since is not None:
+                if target_date is not None or since is not None or until is not None:
                     mtime = os.path.getmtime(path)
                     if target_date is not None and date.fromtimestamp(mtime) != target_date:
                         continue
                     if since is not None and mtime <= since:
+                        continue
+                    if until is not None and mtime > until:
                         continue
                 try:
                     with open(path) as f:
@@ -310,7 +313,7 @@ def iter_sessions(dirs, target_date, since=None):
                        event_label(data), duration, session_score(os.path.dirname(path)))
 
 
-def gather_stats(dirs, target_date, level=0, since=None):
+def gather_stats(dirs, target_date, level=0, since=None, until=None):
     """Tally session stats at one of three breakdown levels:
 
       0 -- by operator
@@ -325,7 +328,7 @@ def gather_stats(dirs, target_date, level=0, since=None):
     is left out of the list entirely rather than counted as a zero."""
     stats = defaultdict(lambda: {"total": 0, "durations": [], "scores": [], "label": None})
 
-    for operator, task_type, event, duration, score in iter_sessions(dirs, target_date, since):
+    for operator, task_type, event, duration, score in iter_sessions(dirs, target_date, since, until):
         label = (operator,)
         if level >= 1:
             label += (task_type or "-",)
@@ -479,24 +482,24 @@ def station_name(override=None):
 
 # ---- shift marks ----
 #
-# A station reports twice a day -- day shift, then night shift -- but a code for
-# today would cover the whole calendar day, so the night code repeated every day
-# session. Operators only export a code when they leave the station, which makes
-# that export the shift boundary: each export records its time as a mark, and the
-# next export that day counts only the sessions finished after it. Nothing new is
-# asked of anyone, and a missing mark just means the old whole-day behaviour.
+# A station reports twice a day -- morning shift, then night shift -- but a code for
+# today would cover the whole calendar day, so the night code repeated every morning
+# session. Operators only export a code when they leave the station, so that export
+# is the shift boundary. Rather than guess from the clock which shift is leaving, the
+# code screen asks: "Is this the end of the morning shift?" while today has no mark,
+# "... of the night shift?" once it has one. A yes, once the code is exported, saves
+# the time as that shift's mark, and the night code counts only the sessions finished
+# after the morning mark. Answering no to everything just shows the numbers.
 #
 # Marks live outside the repo, like ~/.rf-station, so `git pull` never touches them.
 
 SHIFT_MARK_FILE = os.path.expanduser("~/.rf-shift-mark")
 
-# An export this soon after the last one re-does that same window -- a QR the phone
-# would not read, one more session before leaving -- rather than opening a new shift.
-SHIFT_MARK_GRACE_SEC = 60 * 60
-
 # Marks older than this are dropped on the next save. A week keeps last Friday's
 # windows around on a Monday, and the file stays a few lines long.
 SHIFT_MARK_KEEP_DAYS = 7
+
+SHIFTS = ("morning", "night")
 
 
 def shift_mark_path():
@@ -511,11 +514,13 @@ def _valid_window(w):
 
 
 def read_shift_marks():
-    """{"YYYY-MM-DD": [[start, end], ...]}, one [start, end] per exported window, in
-    epoch seconds; start is None for the window that opens the day.
+    """{"YYYY-MM-DD": {"morning": [start, end], "night": [start, end]}}, in epoch
+    seconds. start is None for the morning, which opens the day; end is when that
+    shift's code was exported. A shift with no code that day is simply absent.
 
     A missing or unreadable file reads as no marks -- the whole-day behaviour codes
-    had before marks existed -- rather than stopping a report."""
+    had before marks existed -- rather than stopping a report. So does a day in any
+    other shape, such as the plain lists an earlier version of this script wrote."""
     try:
         with open(shift_mark_path()) as f:
             data = json.load(f)
@@ -523,8 +528,11 @@ def read_shift_marks():
         return {}
     if not isinstance(data, dict):
         return {}
-    return {day: [w for w in windows if _valid_window(w)]
-            for day, windows in data.items() if isinstance(windows, list)}
+    marks = {}
+    for day, shifts in data.items():
+        if isinstance(shifts, dict):
+            marks[day] = {s: w for s, w in shifts.items() if s in SHIFTS and _valid_window(w)}
+    return marks
 
 
 def save_shift_marks(marks, today):
@@ -533,7 +541,7 @@ def save_shift_marks(marks, today):
     report over."""
     path = shift_mark_path()
     oldest = (today - timedelta(days=SHIFT_MARK_KEEP_DAYS)).isoformat()
-    kept = {day: windows for day, windows in marks.items() if day >= oldest}
+    kept = {day: shifts for day, shifts in marks.items() if day >= oldest}
     tmp = path + ".tmp"
     try:
         with open(tmp, "w") as f:
@@ -545,70 +553,147 @@ def save_shift_marks(marks, today):
     return path
 
 
-def shift_window(target_date, now=None):
-    """Plan which part of the day a code for target_date covers, before exporting it.
+def shift_state(target_date, now=None):
+    """Today's marks, for working out which question to ask before a code is built.
 
     Returns None when marks do not apply -- any date other than today, or no date at
     all -- and the code covers the whole date exactly as before. A past day is never
-    split, so re-making last night's code in the morning still works. Otherwise:
-
-      day    -- today's date, the key the mark is saved under
-      since  -- epoch seconds the window opens after, or None for the whole day
-      index  -- which window of the day this is: 0 first, 1 second, ...
-      redo   -- True when this re-exports the last window inside the grace period
+    split, so re-making last night's code in the morning still works. Only today's
+    marks are read, so every day starts with no marks without anyone resetting them.
     """
     now = time.time() if now is None else now
     today = date.fromtimestamp(now)
     if target_date != today:
         return None
-    windows = read_shift_marks().get(today.isoformat(), [])
-    if not windows:
-        return {"day": today, "since": None, "index": 0, "redo": False}
-    start, end = windows[-1]
-    if now - end <= SHIFT_MARK_GRACE_SEC:
-        return {"day": today, "since": start, "index": len(windows) - 1, "redo": True}
-    return {"day": today, "since": end, "index": len(windows), "redo": False}
+    return {"day": today, **read_shift_marks().get(today.isoformat(), {})}
+
+
+def shift_questions(state):
+    """The yes/no questions for today's marks, in the order they are asked, each with
+    the choice a yes makes. The first yes wins; no to all of them means numbers only.
+
+    The questions follow the marks already saved, so an operator is only ever asked
+    about the shift that can be ending: the morning while there is no mark yet, the
+    night once the morning has one, and a redo once both have.
+    """
+    if "morning" not in state:
+        return [("Is this the end of the morning shift?", "end morning")]
+    if "night" not in state:
+        return [("Is this the end of the night shift?", "end night"),
+                ("Redo the morning shift code?", "redo morning")]
+    return [("Redo the night shift code?", "redo night"),
+            ("Redo the morning shift code?", "redo morning")]
+
+
+def shift_window(state, choice):
+    """Which sessions a code covers, from today's marks and the operator's answer.
+
+    choice is one of the choices shift_questions offers, or None for numbers only.
+    Returns None when state is None (not today). Otherwise:
+
+      day      -- today's date, the key marks are saved under
+      shift    -- "morning", "night", or None for numbers only
+      since    -- epoch seconds the window opens after, or None for the start of the day
+      until    -- epoch seconds the window closes at, or None for up to now
+      record   -- True when exporting this code should save a mark
+      redo     -- True when the code re-makes a shift that already has a mark
+      warning  -- a line to show beside the code, or None
+    """
+    if state is None:
+        return None
+    morning, night = state.get("morning"), state.get("night")
+    window = {"day": state["day"], "shift": None, "since": None, "until": None,
+              "record": False, "redo": False, "warning": None}
+
+    if choice == "end morning" and not morning:
+        window.update(shift="morning", record=True)
+    elif choice == "end night" and morning and not night:
+        window.update(shift="night", since=morning[1], record=True)
+    elif choice == "redo morning" and morning and not night:
+        # Nobody has taken over yet, so the morning code stretches to now.
+        window.update(shift="morning", record=True, redo=True)
+    elif choice == "redo morning" and morning:
+        # The night already counts everything after the morning mark: re-make the
+        # morning code exactly as it was, and leave both marks where they are.
+        window.update(shift="morning", until=morning[1], redo=True)
+    elif choice == "redo night" and night:
+        window.update(shift="night", since=night[0], record=True, redo=True)
+    else:
+        # Numbers only: whatever has finished since the last code today.
+        last = night or morning
+        window["since"] = last[1] if last else None
+        if not morning:
+            window["warning"] = ("No morning shift code today -- "
+                                 "these numbers include the whole day.")
+    return window
 
 
 def record_shift_mark(window, now=None):
-    """Record that a code for `window` was just exported, so the next one starts here.
+    """Record that the code for `window` was just exported, as that shift's mark.
 
-    A redo stretches the last window to now instead of adding one. After a
-    successful save the window itself becomes a redo, so exporting the same code
-    twice from one screen stretches the window rather than opening an empty one.
+    Only call this for a window whose "record" is True. Exporting the same code twice
+    from one screen -- a QR, then a copy -- moves the end of the same mark rather than
+    adding one: after a successful save the window counts as a redo.
     Returns the path written, or None if it could not be saved -- the code in hand
-    is still right; the next one would just cover the whole day.
+    is still right; the next one would just be asked as if this one never happened.
     """
-    if window is None:
+    if not window or not window["record"]:
         return None
     now = time.time() if now is None else now
     marks = read_shift_marks()
     key = window["day"].isoformat()
-    windows = marks.get(key, [])
-    entry = [window["since"], round(now, 3)]
-    if window["redo"] and windows:
-        windows[-1] = entry
-    else:
-        windows.append(entry)
-    marks[key] = windows
+    shifts = marks.get(key, {})
+    shifts[window["shift"]] = [window["since"], round(now, 3)]
+    marks[key] = shifts
     path = save_shift_marks(marks, window["day"])
     if path:
         window["redo"] = True
-        window["index"] = len(windows) - 1
     return path
+
+
+def reset_shift_marks(today=None):
+    """Forget today's marks, for a day an operator answered wrongly. Returns today's
+    marks as they were, or None if the file could not be written. Other days are kept."""
+    today = date.today() if today is None else today
+    marks = read_shift_marks()
+    removed = marks.pop(today.isoformat(), {})
+    if save_shift_marks(marks, today) is None:
+        return None
+    return removed
 
 
 def shift_window_desc(window):
     """One line saying what part of the day a code covers, for a person to check."""
     if window is None:
         return None
-    if window["since"] is None:
-        desc = "Covers the whole day so far"
+
+    def hhmm(t):
+        return datetime.fromtimestamp(t).strftime("%H:%M")
+
+    if window["until"] is not None:
+        span = f"sessions finished by {hhmm(window['until'])}"
+    elif window["since"] is not None:
+        span = f"sessions finished after {hhmm(window['since'])}"
     else:
-        since = datetime.fromtimestamp(window["since"]).strftime("%H:%M")
-        shift = "Night shift" if window["index"] == 1 else f"Shift {window['index'] + 1}"
-        desc = f"{shift} -- sessions finished after {since}"
+        span = "covers the whole day so far"
+    if window["shift"] is None:
+        return f"Numbers only, no shift mark -- {span}"
+    desc = f"{window['shift'].capitalize()} shift -- {span}"
+    if window["until"] is not None:
+        return desc + " (re-made, marks unchanged)"
     return desc + (" (re-export)" if window["redo"] else "")
+
+
+def ask_shift_questions(state, ask):
+    """Walk shift_questions with ask(question) -> True/False/None, returning the
+    choice of the first yes, None for no to everything, or "cancel" if ask gave None."""
+    for question, choice in shift_questions(state):
+        answer = ask(question)
+        if answer is None:
+            return "cancel"
+        if answer:
+            return choice
+    return None
 
 
 def code_ops(stats):
@@ -1225,6 +1310,44 @@ def dirs_for(scope):
     return [scope]
 
 
+def shift_window_for_cli(args, target_date):
+    """The shift window for --code: from --end/--redo when given, else by asking in
+    the terminal. With nobody at the terminal to answer -- a script, a test -- it
+    shows the numbers only and records nothing, rather than waiting forever."""
+    state = shift_state(target_date)
+    if state is None:
+        return None
+    offered = [choice for _, choice in shift_questions(state)]
+    if args.end or args.redo:
+        choice = f"end {args.end}" if args.end else f"redo {args.redo}"
+        if choice not in offered:
+            print(f"--{choice} does not fit today's marks "
+                  f"(this code can be: {', '.join(offered)}) -- showing the numbers only.",
+                  file=sys.stderr)
+            choice = None
+    elif args.no_mark:
+        choice = None
+    elif sys.stdin.isatty() and sys.stderr.isatty():
+        # Asked on stderr, so `stats.py --code | pbcopy` still copies only the code.
+        def ask(question):
+            while True:
+                print(f"{question} (y/n) ", end="", file=sys.stderr, flush=True)
+                try:
+                    reply = input().strip().lower()
+                except EOFError:
+                    return None
+                if reply in ("y", "n"):
+                    return reply == "y"
+        choice = ask_shift_questions(state, ask)
+        if choice == "cancel":
+            choice = None
+    else:
+        print("Nobody to ask which shift is ending -- showing the numbers only. "
+              "Pass --end or --redo to record a shift mark.", file=sys.stderr)
+        choice = None
+    return shift_window(state, choice)
+
+
 def main():
     parser = argparse.ArgumentParser(
         epilog="Run with no flags in a terminal to get an interactive menu instead.")
@@ -1241,17 +1364,28 @@ def main():
     parser.add_argument("--code", "--hash", dest="code", action="store_true",
                          help="Print one pasteable line for the rf-admin Shift Report instead of the "
                               "table, so a station's numbers never have to be retyped. Covers today "
-                              "unless -t says otherwise. A code for today covers only sessions "
-                              "finished since the last code made on this station today (the shift "
-                              "mark in ~/.rf-shift-mark), so day and night shift each get their own.")
+                              "unless -t says otherwise. A code for today asks which shift is "
+                              "ending (or take the answer from --end/--redo), and the night code "
+                              "covers only sessions finished after the morning one (the shift "
+                              "marks in ~/.rf-shift-mark).")
     parser.add_argument("--qr", action="store_true",
                          help="Draw the code as a QR code as well, to scan off the station "
                               "screen with a phone instead of copying it off the PC. Implies "
                               "--code.")
+    answer = parser.add_mutually_exclusive_group()
+    answer.add_argument("--end", choices=SHIFTS, default=None,
+                        help="Answer the code's question ahead: this is the end of the morning "
+                             "or night shift. Without it, --code asks in the terminal, or with "
+                             "nobody there to answer, shows the numbers only.")
+    answer.add_argument("--redo", choices=SHIFTS, default=None,
+                        help="Answer the code's question ahead: re-make today's morning or "
+                             "night code.")
     parser.add_argument("--no-mark", action="store_true",
                          help="Build the code without recording a shift mark -- for checking the "
-                              "numbers or testing. The next code still starts after the last "
-                              "recorded mark.")
+                              "numbers or testing. Asks nothing unless --end/--redo is given.")
+    parser.add_argument("--reset-marks", action="store_true",
+                         help="Forget today's shift marks, for a day someone answered the "
+                              "question wrongly. The next code asks about the morning again.")
     parser.add_argument("--email", metavar="ADDRESS", default=None,
                          help="Who the QR code's draft is addressed to. Defaults to "
                               f"{CODE_EMAIL}; pass an empty address to leave the draft for a "
@@ -1264,6 +1398,18 @@ def main():
                               f"({socket.gethostname()!r}).")
     args = parser.parse_args()
     level = min(args.verbose, 2)
+
+    if args.reset_marks:
+        removed = reset_shift_marks()
+        if removed is None:
+            print(f"Could not write {shift_mark_path()} -- nothing was reset.", file=sys.stderr)
+            sys.exit(1)
+        for shift, (_, end) in removed.items():
+            print(f"Removed today's {shift} mark ({datetime.fromtimestamp(end):%H:%M}).",
+                  file=sys.stderr)
+        if not removed:
+            print("No shift marks today -- nothing to reset.", file=sys.stderr)
+        return
     # A QR code is just another way of handing over the same code, so it brings the
     # rest of code mode with it -- today by default, one row per operator.
     code = args.code or args.qr
@@ -1274,14 +1420,15 @@ def main():
     days_ago = 0 if code and args.days_ago is None else args.days_ago
     target_date = date.today() - timedelta(days=days_ago) if days_ago is not None else None
 
-    # A code for today covers only this shift: the sessions finished since the last
-    # code this station made today. Tables and past days are never split.
-    window = shift_window(target_date) if code else None
+    # A code for today covers only the shift that is ending, which the operator
+    # confirms. Tables and past days are never split.
+    window = shift_window_for_cli(args, target_date) if code else None
 
     # A code carries one row per operator, so it always gathers at level 0 --
     # -v/-vv only shape the printed table.
     stats = gather_stats(dirs, target_date, 0 if code else level,
-                         window["since"] if window else None)
+                         window["since"] if window else None,
+                         window["until"] if window else None)
 
     if code:
         # Naming a station is how you set one up, so the name sticks rather than
@@ -1296,6 +1443,8 @@ def main():
         print(code_summary(payload), file=sys.stderr)
         if window is not None:
             print(shift_window_desc(window), file=sys.stderr)
+            if window["warning"]:
+                print(window["warning"], file=sys.stderr)
         if args.qr:
             try:
                 address = CODE_EMAIL if args.email is None else args.email
@@ -1304,9 +1453,10 @@ def main():
                 print(f"Too many operators to fit a QR code ({e}) -- copy the line instead.",
                       file=sys.stderr)
         print(text)
-        if window is not None and not args.no_mark and record_shift_mark(window) is None:
+        if (window is not None and window["record"] and not args.no_mark
+                and record_shift_mark(window) is None):
             print(f"Could not save the shift mark to {shift_mark_path()} -- the next code "
-                  "will cover the whole day.", file=sys.stderr)
+                  "will not know this one was made.", file=sys.stderr)
         return
 
     filter_desc = f"{target_date} ({days_ago} day(s) ago)" if target_date is not None else None
@@ -1386,6 +1536,28 @@ def curses_prompt_str(stdscr, prompt, default="", width=200):
     curses.noecho()
     curses.curs_set(0)
     return raw or default
+
+
+def curses_yes_no(stdscr, title, question, subtitle=None):
+    """Ask a yes/no question. Returns True for y, False for n, None for q/Esc."""
+    curses.curs_set(0)
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        width = max(w - 4, 0)
+        _addstr(stdscr, 0, 2, title[:width], curses.A_BOLD)
+        if subtitle:
+            _addstr(stdscr, 1, 2, subtitle[:width], curses.A_DIM)
+        _addstr(stdscr, 3, 2, f"{question} (y/n)"[:width])
+        _addstr(stdscr, h - 1, 2, "y yes   n no   q back"[:width], curses.A_DIM)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        ch = key_char(key)
+        if ch in ("y", "n"):
+            return ch == "y"
+        if key == 27 or ch == "q":
+            return None
 
 
 def curses_prompt_int(stdscr, prompt, default=0):
@@ -1542,15 +1714,26 @@ def tui_code(stdscr, scope, days_ago, code_state):
     run on this machine already knows it. The scan runs at level 0 -- one row per
     operator, matching what a station block holds.
     """
+    target_date = date.today() - timedelta(days=days_ago) if days_ago is not None else None
+    # The answer decides which sessions the code holds, so it is asked before the code
+    # is built. It is only recorded when the code actually leaves the screen (QR or
+    # copy) -- answering, or just looking at the code, never moves a shift mark.
+    state = shift_state(target_date)
+    window = None
+    if state is not None:
+        choice = ask_shift_questions(
+            state, lambda q: curses_yes_no(stdscr, "Shift Report code", q,
+                                           "Answer no to everything to just see the numbers."))
+        if choice == "cancel":
+            return
+        window = shift_window(state, choice)
+
     stdscr.erase()
     _addstr(stdscr, 0, 2, "Building code...", curses.A_DIM)
     stdscr.refresh()
-
-    target_date = date.today() - timedelta(days=days_ago) if days_ago is not None else None
-    # Planned on arrival, recorded only when the code actually leaves the screen
-    # (QR or copy) -- just looking at the code never moves the shift mark.
-    window = shift_window(target_date)
-    stats = gather_stats(dirs_for(scope), target_date, 0, window["since"] if window else None)
+    stats = gather_stats(dirs_for(scope), target_date, 0,
+                         window["since"] if window else None,
+                         window["until"] if window else None)
     status = ""
 
     while True:
@@ -1562,9 +1745,13 @@ def tui_code(stdscr, scope, days_ago, code_state):
         width = max(w - 4, 20)
         _addstr(stdscr, 0, 2, "Shift Report code", curses.A_BOLD)
         _addstr(stdscr, 1, 2, code_summary(payload)[:width], curses.A_DIM)
+        row = 3
         if window is not None:
             _addstr(stdscr, 2, 2, shift_window_desc(window)[:width], curses.A_DIM)
-        row = 4 if window is not None else 3
+            row = 4
+            if window["warning"]:
+                _addstr(stdscr, 3, 2, window["warning"][:width], curses.A_BOLD)
+                row = 5
         for i in range(0, len(code), width):
             if row >= h - 3:
                 break
@@ -1580,7 +1767,7 @@ def tui_code(stdscr, scope, days_ago, code_state):
         if ch in ("p", "c"):
             # Mark before showing the QR: an operator may scan it and walk away with
             # it still on screen, and the mark has to be saved by then.
-            unsaved = window is not None and record_shift_mark(window) is None
+            unsaved = window is not None and window["record"] and record_shift_mark(window) is None
             if ch == "p":
                 tui_qr(stdscr, code, code_subject(payload))
                 status = ""
@@ -1590,7 +1777,7 @@ def tui_code(stdscr, scope, days_ago, code_state):
                           "No clipboard tool found -- select the code above to copy it.")
             if unsaved:
                 status = (status + "  " if status else "") + \
-                         "Shift mark not saved -- the next code will cover the whole day."
+                         "Shift mark not saved -- the next code will not know this one was made."
         elif ch == "n":
             name = curses_prompt_str(stdscr, "Station name (as labelled in the Shift Report)",
                                      default=code_state["name"])

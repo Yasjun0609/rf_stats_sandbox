@@ -87,24 +87,42 @@ The paste box on the other end lives in the rf-admin repo, documented in
 ### One code per shift
 
 A station reports twice a day, but a code for today used to cover the whole
-calendar day — so the night shift's code repeated every day-shift session.
+calendar day — so the night shift's code repeated every morning session.
 Operators only make a code when they leave the station, so that moment is the
-shift boundary: each exported code (QR or copy, or `--code`/`--qr`) records its
-time in `~/.rf-shift-mark`, and the next code that day counts only the sessions
-**finished after it**. The code screen and `--code` both print which part of the
-day a code covers, e.g. `Night shift -- sessions finished after 15:14`.
+shift boundary. Rather than guess from the clock, the code screen asks, before it
+builds the code:
 
-- Nothing new to do on the floor: make the QR before handing the station over,
-  and on nights, before moving captures into `upload`.
-- Exporting again within an hour re-does the same window (a QR the phone would
-  not read, one more session before leaving) instead of starting a new one.
-- Only today's marks count, so the day starts whole every morning. Codes for past
-  days (`-t 1`) are never split and never leave a mark. Marks older than a week
-  are dropped.
-- Just looking at the code screen, or at the table, never moves the mark.
-  `--no-mark` builds a code without recording one.
-- If the mark can't be read or written, the code covers the whole day — exactly
-  the behaviour before marks existed.
+| Today's marks   | Asked, in order                                              |
+|-----------------|--------------------------------------------------------------|
+| none            | Is this the end of the morning shift?                        |
+| morning         | Is this the end of the night shift? / Redo the morning shift code? |
+| morning + night | Redo the night shift code? / Redo the morning shift code?    |
+
+The first yes decides the code; no to everything just shows the numbers. Once the
+code is exported (QR or copy), the answer is saved in `~/.rf-shift-mark` as that
+shift's mark, and the night code counts only the sessions **finished after** the
+morning mark. The code screen and `--code` both print which part of the day a
+code covers, e.g. `Night shift -- sessions finished after 15:14`.
+
+- Nothing new to do on the floor beyond the question: make the QR before handing
+  the station over, and on nights, before moving captures into `upload`.
+- Exporting the same code twice (a QR the phone would not read, then a copy) moves
+  that shift's mark rather than adding one. Redoing the morning before the night
+  has a code stretches the morning to now; after the night has one, it re-makes the
+  morning code exactly as it was and moves no marks.
+- If the morning left without a code, the night is asked about the morning; no
+  shows the whole day's numbers with `No morning shift code today` beside them.
+- Only today's marks count, so every day starts with none — nothing to reset.
+  Codes for past days (`-t 1`) are never split, ask nothing and never leave a mark.
+  Marks older than a week are dropped. `--reset-marks` forgets today's marks, for a
+  day someone answered wrongly.
+- Answering, or just looking at the code screen or the table, never moves a mark.
+- On the command line, `--end morning|night` or `--redo morning|night` answers
+  ahead. Without them `--code` asks in the terminal (on stderr, so piping stays
+  clean), or with nobody there to answer, shows the numbers only. `--no-mark`
+  builds a code without recording one.
+- If the mark file can't be read or written, the code covers the whole day —
+  exactly the behaviour before marks existed.
 - `$RF_SHIFT_MARK` points the mark file elsewhere, which is how the tests in
   `tests/` run without touching a real station: `python3 -m unittest discover -s tests`.
 
