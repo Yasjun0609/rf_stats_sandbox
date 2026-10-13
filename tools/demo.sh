@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Walk through the shift marks on fake data -- sandbox only, not for rf-stats.
+# Walk through the shift marks on fake data. Demo only -- remove before merging to main.
 #
 #     bash tools/demo.sh
 #

@@ -1,4 +1,4 @@
-"""Fake station data for trying the shift marks by hand -- sandbox only, not for rf-stats.
+"""Fake station data for trying the shift marks by hand. Demo only -- remove before merging to main.
 
     python3 tools/make_fake.py morning DIR   # a morning shift's sessions + two from yesterday
     python3 tools/make_fake.py night   DIR   # night sessions finished after the morning code
